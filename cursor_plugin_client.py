@@ -19,7 +19,14 @@ import os
 import signal
 import uuid
 import websockets
+from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    print(f"{ts} {msg}", flush=True)
+
 
 # Config from environment
 SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
@@ -30,11 +37,31 @@ WORK_DIR = Path(os.environ.get("WORK_DIR", "/workspace"))
 CURSOR_ARGS = os.environ.get("CURSOR_ARGS", "").split()
 
 if not SIJBA_TOKEN:
-    print("ERROR: SIJBA_TOKEN environment variable required")
+    _log("ERROR: SIJBA_TOKEN environment variable required")
     exit(1)
 
 # Ensure work dir exists
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _describe_tool_call(tool_call: dict) -> str:
+    """Best-effort human-readable summary of a cursor-agent tool_call event,
+    e.g. "shell: sleep 3" or "read: /path/to/file" instead of just the raw
+    "shellToolCall" wrapper key."""
+    for key, val in tool_call.items():
+        if not key.endswith("ToolCall") or not isinstance(val, dict):
+            continue
+        label = key[: -len("ToolCall")]
+        args = val.get("args", {})
+        detail = (
+            args.get("command")
+            or args.get("path")
+            or args.get("globPattern")
+            or args.get("query")
+            or args.get("description")
+        )
+        return f"{label}: {detail}" if detail else label
+    return "tool"
 
 
 class CursorSession:
@@ -54,7 +81,7 @@ class CursorSession:
         self.cursor_session_id: str | None = None  # cursor-agent's own session id
 
     async def start(self):
-        print(f"[{self.session_id}] Cursor session ready (conversation mode)")
+        _log(f"[{self.session_id}] Cursor session ready (conversation mode)")
 
     async def send(self, text: str, request_id: int, on_chunk=None) -> dict:
         """Run one turn, forwarding incremental text to `on_chunk(delta)` as
@@ -73,7 +100,7 @@ class CursorSession:
             cmd += ["--resume", self.cursor_session_id]
         cmd += CURSOR_ARGS + [text]
 
-        print(f"[{self.session_id}] Running: {' '.join(cmd[:-1])} <prompt> (in {self.work_dir})")
+        _log(f"[{self.session_id}] Running: {' '.join(cmd[:-1])} <prompt> (in {self.work_dir})")
 
         proc = None
         try:
@@ -116,9 +143,8 @@ class CursorSession:
 
                     elif etype == "tool_call" and event.get("subtype") == "started":
                         tool_call = event.get("tool_call") or {}
-                        tool_name = next(iter(tool_call), "tool")
                         if on_chunk:
-                            await on_chunk(f"\n_[{tool_name}]_\n")
+                            await on_chunk(f"\n_[{_describe_tool_call(tool_call)}]_\n")
 
                     elif etype == "result":
                         final_text = event.get("result", "")
@@ -138,7 +164,7 @@ class CursorSession:
             await proc.wait()
 
             if stderr_buf:
-                print(f"[{self.session_id}] stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
+                _log(f"[{self.session_id}] stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
 
             return {"text": final_text or "(no output)", "request_id": request_id}
 
@@ -152,7 +178,7 @@ class CursorSession:
             return {"text": f"Error: {exc}", "request_id": request_id}
 
     async def close(self):
-        print(f"[{self.session_id}] Cursor session closed")
+        _log(f"[{self.session_id}] Cursor session closed")
 
 
 class SijbaPluginClient:
@@ -170,14 +196,14 @@ class SijbaPluginClient:
         ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}"
 
-        print(f"Connecting to {ws_url} as {PLUGIN_ID}")
+        _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
         self.ws = await websockets.connect(
             ws_url,
             ping_interval=20,
             ping_timeout=10,
             close_timeout=5,
         )
-        print("Connected!")
+        _log("Connected!")
 
         # Register plugin
         await self.ws.send(json.dumps({
@@ -211,9 +237,9 @@ class SijbaPluginClient:
                 mtype = msg.get("type")
 
                 if mtype == "registered":
-                    print(f"Plugin registered: {msg['plugin_id']}")
+                    _log(f"Plugin registered: {msg['plugin_id']}")
                 elif mtype == "channel_registered":
-                    print(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
+                    _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
                 elif mtype == "message":
                     await self.handle_message(msg)
                 elif mtype == "ping":
@@ -221,11 +247,11 @@ class SijbaPluginClient:
                 elif mtype == "pong":
                     pass
                 elif mtype == "error":
-                    print(f"Server error: {msg.get('message')}")
+                    _log(f"Server error: {msg.get('message')}")
         except websockets.ConnectionClosed:
-            print("Connection closed")
+            _log("Connection closed")
         except Exception as exc:
-            print(f"Message loop error: {exc}")
+            _log(f"Message loop error: {exc}")
         finally:
             self.running = False
 
@@ -262,15 +288,19 @@ class SijbaPluginClient:
                     "text": delta,
                 }))
             except Exception as exc:
-                print(f"Failed to send reply_chunk: {exc}")
+                _log(f"Failed to send reply_chunk: {exc}")
 
         # Send to Cursor
+        _log(f"[{channel_id}] handling envelope={envelope_id} text={text[:120]!r}")
+        started = asyncio.get_event_loop().time()
         try:
             request_id = len(self.sessions)  # simple unique ID
             response = await session.send(text, request_id, on_chunk=_on_chunk)
             reply_text = response.get("text", "")
         except Exception as exc:
             reply_text = f"Error: {exc}"
+        elapsed = asyncio.get_event_loop().time() - started
+        _log(f"[{channel_id}] done envelope={envelope_id} in {elapsed:.1f}s reply={reply_text[:120]!r}")
 
         # Send reply back to sijba
         try:
@@ -282,7 +312,7 @@ class SijbaPluginClient:
                 "continue": True
             }))
         except Exception as exc:
-            print(f"Failed to send reply: {exc}")
+            _log(f"Failed to send reply: {exc}")
 
     async def run_forever(self):
         """Main loop with auto-reconnect."""
@@ -297,10 +327,10 @@ class SijbaPluginClient:
             try:
                 await self.connect()
             except Exception as exc:
-                print(f"Connection failed: {exc}")
+                _log(f"Connection failed: {exc}")
             if self.shutdown_event.is_set():
                 break
-            print(f"Reconnecting in {self._reconnect_backoff}s...")
+            _log(f"Reconnecting in {self._reconnect_backoff}s...")
             try:
                 await asyncio.wait_for(self.shutdown_event.wait(), timeout=self._reconnect_backoff)
             except asyncio.TimeoutError:
@@ -310,7 +340,7 @@ class SijbaPluginClient:
         # Cleanup
         for session in self.sessions.values():
             await session.close()
-        print("Shutdown complete")
+        _log("Shutdown complete")
 
 
 async def main():
