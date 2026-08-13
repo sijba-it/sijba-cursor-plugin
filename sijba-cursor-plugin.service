@@ -1,0 +1,21 @@
+[Unit]
+Description=SIJBA Cursor Plugin
+After=network.target
+
+[Service]
+Type=simple
+User=robert
+WorkingDirectory=/home/robert/sijba-cursor-plugin
+Environment=SIJBA_URL=https://sijba.edv-bartl.at
+Environment=SIJBA_TOKEN=your-token-here
+Environment=PLUGIN_ID=cursor-dev-vm
+Environment=WORK_DIR=/home/robert/projects
+Environment=CURSOR_ARGS=
+ExecStart=/home/robert/sijba-cursor-plugin/.venv/bin/python cursor_plugin_client.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
