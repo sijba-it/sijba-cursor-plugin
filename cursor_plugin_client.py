@@ -176,14 +176,19 @@ class CursorSession:
             if stderr_buf:
                 _log(f"[{self.session_id}] stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
 
-            status = (
-                f"— {model} · {_fmt_tokens(usage.get('inputTokens', 0))} in"
-                f" ({_fmt_tokens(usage.get('cacheReadTokens', 0))} cached) /"
-                f" {_fmt_tokens(usage.get('outputTokens', 0))} out —"
+            _log(
+                f"[{self.session_id}] usage model={model} "
+                f"in={_fmt_tokens(usage.get('inputTokens', 0))} "
+                f"cached={_fmt_tokens(usage.get('cacheReadTokens', 0))} "
+                f"out={_fmt_tokens(usage.get('outputTokens', 0))}"
             )
-            _log(f"[{self.session_id}] usage {status}")
 
-            return {"text": (final_text or "(no output)") + f"\n\n{status}", "request_id": request_id}
+            return {
+                "text": final_text or "(no output)",
+                "request_id": request_id,
+                "model": model,
+                "usage": usage,
+            }
 
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
@@ -328,6 +333,7 @@ class SijbaPluginClient:
         # Send to Cursor
         _log(f"[{channel_id}] handling envelope={envelope_id} text={text[:120]!r}")
         started = asyncio.get_event_loop().time()
+        response: dict = {}
         try:
             request_id = len(self.sessions)  # simple unique ID
             response = await session.send(text, request_id, on_chunk=_on_chunk)
@@ -336,6 +342,22 @@ class SijbaPluginClient:
             reply_text = f"Error: {exc}"
         elapsed = asyncio.get_event_loop().time() - started
         _log(f"[{channel_id}] done envelope={envelope_id} in {elapsed:.1f}s reply={reply_text[:120]!r}")
+
+        # Publish current model/context size on the channel itself (shown in
+        # the channel list / header) rather than appending it to every reply.
+        if response.get("model"):
+            usage = response.get("usage") or {}
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "channel_update",
+                    "channel_id": channel_id,
+                    "metadata": {
+                        "model": response["model"],
+                        "context_tokens": usage.get("inputTokens", 0),
+                    },
+                }))
+            except Exception as exc:
+                _log(f"Failed to send channel_update: {exc}")
 
         # Send reply back to sijba
         try:
