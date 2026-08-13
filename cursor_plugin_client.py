@@ -44,6 +44,10 @@ if not SIJBA_TOKEN:
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _fmt_tokens(n: int) -> str:
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 def _describe_tool_call(tool_call: dict) -> str:
     """Best-effort human-readable summary of a cursor-agent tool_call event,
     e.g. "shell: sleep 3" or "read: /path/to/file" instead of just the raw
@@ -112,10 +116,12 @@ class CursorSession:
             )
 
             final_text = ""
+            model = "?"
+            usage: dict = {}
             stderr_buf = bytearray()
 
             async def _pump_stdout() -> None:
-                nonlocal final_text
+                nonlocal final_text, model, usage
                 while True:
                     line = await proc.stdout.readline()
                     if not line:
@@ -126,7 +132,10 @@ class CursorSession:
                         continue
                     etype = event.get("type")
 
-                    if etype == "assistant":
+                    if etype == "system" and event.get("subtype") == "init":
+                        model = event.get("model", model)
+
+                    elif etype == "assistant":
                         # Alongside real deltas, cursor-agent emits a recap
                         # event that repeats the full accumulated text — once
                         # before each tool call (tagged with model_call_id)
@@ -148,6 +157,7 @@ class CursorSession:
 
                     elif etype == "result":
                         final_text = event.get("result", "")
+                        usage = event.get("usage") or {}
                         if event.get("session_id"):
                             self.cursor_session_id = event["session_id"]
 
@@ -166,7 +176,14 @@ class CursorSession:
             if stderr_buf:
                 _log(f"[{self.session_id}] stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
 
-            return {"text": final_text or "(no output)", "request_id": request_id}
+            status = (
+                f"— {model} · {_fmt_tokens(usage.get('inputTokens', 0))} in"
+                f" ({_fmt_tokens(usage.get('cacheReadTokens', 0))} cached) /"
+                f" {_fmt_tokens(usage.get('outputTokens', 0))} out —"
+            )
+            _log(f"[{self.session_id}] usage {status}")
+
+            return {"text": (final_text or "(no output)") + f"\n\n{status}", "request_id": request_id}
 
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
@@ -269,6 +286,24 @@ class SijbaPluginClient:
                 break
 
         if not text:
+            return
+
+        if text.lstrip().startswith("/"):
+            # cursor-agent hangs indefinitely on slash commands ("/help",
+            # "/model", ...) when run headless via -p — there's no TTY for
+            # whatever interactive UI they expect. Fail fast instead of
+            # tying up the channel for the full 600s timeout.
+            _log(f"[{channel_id}] rejected slash command: {text[:60]!r}")
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "reply",
+                    "channel": channel_id,
+                    "envelope_id": envelope_id,
+                    "text": "Slash commands (/help, /model, ...) hang in headless mode — not supported here. Just describe what you want in plain text.",
+                    "continue": True,
+                }))
+            except Exception as exc:
+                _log(f"Failed to send reply: {exc}")
             return
 
         # Get or create session for this channel
