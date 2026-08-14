@@ -1,63 +1,57 @@
 # sijba-cursor-plugin
 
-External plugin for sijba that connects Cursor Agent as a channel.
+Standalone Cursor Agent plugin for sijba — a `kind: git` catalog plugin for
+[sijba-agent-controller](https://REDACTED-GIT-HOST/sijba/sijba-agent-controller),
+but runnable on its own too. No dependency on the controller's own code;
+just the documented env-var contract.
 
-## Quick Start
+## Quick start
 
 ```bash
-# 1. Create venv & install deps
 python3 -m venv .venv
 source .venv/bin/activate
 pip install websockets
 
-# 2. Set environment variables
 export SIJBA_URL=https://sijba.edv-bartl.at
 export SIJBA_TOKEN=your-token-here
-export PLUGIN_ID=cursor-dev-vm
-export WORK_DIR=/home/robert/projects
+export PROJECT_NAME=my-project
+export WORK_DIR=/path/to/my-project
+export REGISTRY_FILE=/path/to/registry.json   # shared with the controller, for /archive and /pause
 
-# 3. Run
-python cursor_plugin_client.py
+python main.py
 ```
 
 ## Usage in sijba
 
-Once connected, send messages to Cursor via sijba:
+Registers one channel, `cursor:<PROJECT_NAME>`, triggered by the project
+name itself:
 
 ```
-cursor refactor this function to use async/await
-@cursor write a test for the login handler
-cursor explain this codebase structure
+my-project refactor this function to use async/await
 ```
 
-## Trigger Words
+In-channel commands (handled locally, never reach the `cursor-agent` CLI):
 
-- `cursor ...`
-- `@cursor ...`
+- `/archive` — write `REGISTRY_FILE`'s status for this project to
+  `archived`, then exit with code `90` and stop. No auto-restart.
+- `/pause` — same, status `paused`, exit code `91`.
+- `/log [n]` — last `n` (default 10) of this process's own log lines.
 
-## Channel Metadata
-
-The plugin registers with metadata that sijba passes through:
-
-```json
-{
-  "editor": "cursor",
-  "working_dir": "/home/robert/projects",
-  "mode": "agent",
-  "custom": {"team": "backend", "project": "sijba"}
-}
-```
-
-## Cursor CLI Requirements
+## Cursor CLI requirements
 
 - Cursor must be installed and in PATH (or set `CURSOR_CMD`)
-- Uses `cursor --agent -p "prompt"` for one-shot agent mode
-- Extra args via `CURSOR_ARGS` env var
+- Uses `cursor-agent -p --force --resume <session>` per turn (headless,
+  auto-approves tool calls — no TTY to prompt on)
+- Extra args via `CURSOR_ARGS`
 
-## systemd Service
+## Managed by the controller
 
-```bash
-sudo cp sijba-cursor-plugin.service /etc/systemd/system/
-# Edit Environment= values
-sudo systemctl enable --now sijba-cursor-plugin
+Registered in `sijba-agent-controller`'s catalog as:
+
 ```
+catalog add cursor --git ssh://git@REDACTED-GIT-HOST:7999/sijba/sijba-cursor-plugin.git
+```
+
+The controller clones this repo into its own `_plugins/cursor/`, then runs
+`main.py` with `SIJBA_URL`/`SIJBA_TOKEN`/`PROJECT_NAME`/`WORK_DIR`/`REGISTRY_FILE`
+set for whichever project it's supervising.
