@@ -35,6 +35,9 @@ In-channel commands (handled locally, never reach the `cursor-agent` CLI):
 - `/archive` — write `REGISTRY_FILE`'s status for this project to
   `archived`, then exit with code `90` and stop. No auto-restart.
 - `/pause` — same, status `paused`, exit code `91`.
+- `/reset` — drop the remembered `cursor-agent` session id; the next turn
+  omits `--resume` and starts a brand-new conversation. No prior context;
+  doesn't touch the registry or the sijba channel.
 - `/log [n]` — last `n` (default 10) of this process's own log lines.
 
 ## Cursor CLI requirements

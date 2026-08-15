@@ -135,6 +135,13 @@ class CursorSession:
     async def start(self):
         _log("Cursor session ready (conversation mode)")
 
+    async def reset(self) -> None:
+        """Drop the remembered cursor-agent session id — the next turn omits
+        --resume, so cursor-agent starts a brand-new conversation instead of
+        continuing the old one."""
+        self.cursor_session_id = None
+        _log("Cursor session reset")
+
     async def send(self, text: str, request_id: int, on_chunk=None) -> dict:
         cmd = [CURSOR_CMD, "-p", "--force", "--output-format", "stream-json", "--stream-partial-output"]
         if self.cursor_session_id:
@@ -312,12 +319,18 @@ class PluginClient:
             await self.ws.close()
             return True
 
+        if cmd == "reset":
+            await self.session.reset()
+            self.session_started = False
+            await self._reply(channel_id, envelope_id, f"{PROJECT_NAME} reset — next message starts fresh, no prior context.")
+            return True
+
         if cmd:
             # Slash commands meant for cursor-agent itself (/help, /model, ...)
             # hang indefinitely in headless mode — fail fast instead.
             await self._reply(
                 channel_id, envelope_id,
-                "Unsupported here: /archive, /pause, /log [n]. Anything else — just plain text.",
+                "Unsupported here: /archive, /pause, /reset, /log [n]. Anything else — just plain text.",
             )
             return True
         return False
