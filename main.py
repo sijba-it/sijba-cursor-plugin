@@ -155,6 +155,13 @@ class CursorSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.work_dir,
+                # asyncio's StreamReader default line-length limit is 64KiB —
+                # one JSON-lines event carrying a large file read/diff/tool
+                # result easily exceeds that, and readline() then raises
+                # LimitOverrunError ("Separator is found, but chunk is
+                # longer than limit") mid-stream, wiping out whatever had
+                # already streamed to the user with that error text instead.
+                limit=10 * 1024 * 1024,
             )
             final_text = ""
             model = "?"
