@@ -106,6 +106,47 @@ def _fmt_tokens(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
+# Chat bubbles aren't the place for a raw multi-KB/MB blob (a tool result
+# embedding a big file read, a huge diff, ...) — cap what actually reaches
+# sijba, independent of how large the underlying event was.
+MAX_CHARS_TO_UI = 8000
+
+
+def _truncate(text: str, limit: int = MAX_CHARS_TO_UI) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…[truncated, {len(text) - limit} more chars]"
+
+
+async def _iter_json_lines(stream: asyncio.StreamReader):
+    """Yield complete newline-delimited lines with no hard size limit.
+
+    `StreamReader.readline()` has a fixed buffer limit (64KiB by default)
+    and *raises* LimitOverrunError if a single line exceeds it before the
+    separator is found — which happened live: a JSON-lines event with a
+    large embedded file/diff blew past that, and the exception replaced
+    the whole in-progress reply with an error instead of just being one
+    long event. Read raw chunks and split on our own unbounded buffer
+    instead — a huge line just accumulates in memory (bounded only by
+    what's actually available, not an arbitrary fixed ceiling) rather than
+    blowing up the read.
+    """
+    buf = bytearray()
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            if buf:
+                yield bytes(buf)
+            return
+        buf.extend(chunk)
+        while True:
+            idx = buf.find(b"\n")
+            if idx < 0:
+                break
+            yield bytes(buf[:idx])
+            del buf[: idx + 1]
+
+
 def _describe_tool_call(tool_call: dict) -> str:
     for key, val in tool_call.items():
         if not key.endswith("ToolCall") or not isinstance(val, dict):
@@ -155,13 +196,6 @@ class CursorSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.work_dir,
-                # asyncio's StreamReader default line-length limit is 64KiB —
-                # one JSON-lines event carrying a large file read/diff/tool
-                # result easily exceeds that, and readline() then raises
-                # LimitOverrunError ("Separator is found, but chunk is
-                # longer than limit") mid-stream, wiping out whatever had
-                # already streamed to the user with that error text instead.
-                limit=10 * 1024 * 1024,
             )
             final_text = ""
             model = "?"
@@ -170,13 +204,10 @@ class CursorSession:
 
             async def _pump_stdout() -> None:
                 nonlocal final_text, model, usage
-                while True:
-                    line = await proc.stdout.readline()
-                    if not line:
-                        break
+                async for line in _iter_json_lines(proc.stdout):
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     etype = event.get("type")
                     if etype == "system" and event.get("subtype") == "init":
@@ -188,13 +219,13 @@ class CursorSession:
                         for part in event.get("message", {}).get("content", []):
                             delta = part.get("text", "")
                             if delta and on_chunk:
-                                await on_chunk(delta)
+                                await on_chunk(_truncate(delta))
                     elif etype == "tool_call" and event.get("subtype") == "started":
                         tool_call = event.get("tool_call") or {}
                         if on_chunk:
                             await on_chunk(f"\n_[{_describe_tool_call(tool_call)}]_\n")
                     elif etype == "result":
-                        final_text = event.get("result", "")
+                        final_text = _truncate(event.get("result", ""))
                         usage = event.get("usage") or {}
                         if event.get("session_id"):
                             self.cursor_session_id = event["session_id"]
