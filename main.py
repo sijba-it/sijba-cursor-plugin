@@ -50,7 +50,7 @@ SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
 WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
 REGISTRY_FILE = os.environ.get("REGISTRY_FILE", "")
-CURSOR_CMD = os.environ.get("CURSOR_CMD", "cursor-agent")
+CURSOR_CMD = os.environ.get("CURSOR_CMD", str(Path.home() / ".local" / "bin" / "cursor-agent"))
 CURSOR_ARGS = os.environ.get("CURSOR_ARGS", "").split()
 
 if not SIJBA_TOKEN:
