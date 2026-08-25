@@ -34,6 +34,8 @@ import os
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -145,6 +147,38 @@ async def _iter_json_lines(stream: asyncio.StreamReader):
                 break
             yield bytes(buf[:idx])
             del buf[: idx + 1]
+
+
+def _http_base() -> str:
+    return SIJBA_URL.replace("wss://", "https://").replace("ws://", "http://")
+
+
+def _download_attachment(url: str, token: str, dest: Path) -> None:
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        dest.write_bytes(resp.read())
+
+
+async def _fetch_attachments(attachments: list, work_dir: Path) -> list[str]:
+    """Download attachments from Core into work_dir/sijba-uploads — Cursor's
+    plugin process runs on its own host, no filesystem shared with Core, so
+    the file has to be pulled over HTTP before cursor-agent can see it."""
+    if not attachments:
+        return []
+    dest_dir = work_dir / "sijba-uploads"
+    dest_dir.mkdir(exist_ok=True)
+    fetched = []
+    for att in attachments:
+        filename = Path(att.get("filename") or "file").name
+        dest = dest_dir / filename
+        url = f"{_http_base()}/api/upload/{att['id']}"
+        try:
+            await asyncio.to_thread(_download_attachment, url, SIJBA_TOKEN, dest)
+            fetched.append(f"sijba-uploads/{filename}")
+            _log(f"downloaded attachment: {filename}")
+        except (urllib.error.URLError, OSError, KeyError) as exc:
+            _log(f"attachment download failed ({filename}): {exc}")
+    return fetched
 
 
 def _describe_tool_call(tool_call: dict) -> str:
@@ -378,17 +412,24 @@ class PluginClient:
         payload = msg["payload"]
         envelope_id = payload["envelope_id"]
         text = payload["text"]
+        attachments = payload.get("attachments") or []
 
         for trigger in (PROJECT_NAME, CHANNEL_ID):
             if text.lower().startswith(trigger.lower()):
                 text = text[len(trigger):].strip()
                 break
-        if not text:
+        if not text and not attachments:
             return
 
         if text.lstrip().startswith("/"):
             if await self._handle_local_command(channel_id, envelope_id, text.lstrip()):
                 return
+
+        fetched = await _fetch_attachments(attachments, WORK_DIR)
+        if fetched:
+            text = f"[Angehängte Datei(en): {', '.join(fetched)}]\n\n{text}".strip()
+        if not text:
+            return
 
         if not self.session_started:
             await self.session.start()
