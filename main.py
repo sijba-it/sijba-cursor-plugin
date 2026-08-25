@@ -154,7 +154,15 @@ def _http_base() -> str:
 
 
 def _download_attachment(url: str, token: str, dest: Path) -> None:
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    # Explicit User-Agent required: urllib's default ("Python-urllib/x.y")
+    # gets a 403 from the WAF in front of sijba before the request ever
+    # reaches Core's own auth check — verified live (curl with the same
+    # bearer token but its own UA reaches the app fine and gets a normal
+    # 401/404; the bare Python UA gets 403 regardless of the header).
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {token}", "User-Agent": "sijba-cursor-plugin/1.0"},
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         dest.write_bytes(resp.read())
 
@@ -426,8 +434,15 @@ class PluginClient:
                 return
 
         fetched = await _fetch_attachments(attachments, WORK_DIR)
+        note = ""
         if fetched:
-            text = f"[Angehängte Datei(en): {', '.join(fetched)}]\n\n{text}".strip()
+            note += f"[Angehängte Datei(en): {', '.join(fetched)}]\n\n"
+        if len(fetched) < len(attachments):
+            # Surfaced in-chat rather than only in the plugin's own log — a
+            # silently-dropped attachment otherwise looks indistinguishable
+            # from "the agent just ignored the file".
+            note += f"[Achtung: {len(attachments) - len(fetched)} Anhang/Anhänge konnten nicht geladen werden]\n\n"
+        text = f"{note}{text}".strip()
         if not text:
             return
 
