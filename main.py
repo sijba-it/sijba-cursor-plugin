@@ -465,9 +465,18 @@ class PluginClient:
 
     async def run_forever(self):
         loop = asyncio.get_event_loop()
+
+        def _request_shutdown() -> None:
+            # Setting the event alone doesn't unblock message_loop()'s
+            # `async for raw in self.ws` below — close the socket too, or
+            # shutdown just hangs until the connection drops on its own.
+            self.shutdown_event.set()
+            if self.ws is not None:
+                asyncio.ensure_future(self.ws.close())
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, self.shutdown_event.set)
+                loop.add_signal_handler(sig, _request_shutdown)
             except NotImplementedError:
                 pass
 
