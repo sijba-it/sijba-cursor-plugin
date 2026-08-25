@@ -315,12 +315,26 @@ class PluginClient:
         self.exit_code = 0
         self._reconnect_backoff = 5
         self._request_id = 0
+        # Keep the WS read loop free to answer pings while a turn runs —
+        # blocking `await handle_message` caused keepalive timeouts and
+        # dropped follow-up messages when the socket then died.
+        self._msg_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        # envelope_id -> Event (set when the turn finishes). Lets a Core
+        # redelivery wait for the in-flight turn instead of double-running.
+        self._inflight: dict[str, asyncio.Event] = {}
+        # envelope_id -> final reply text (resend on redelivery, no re-run).
+        self._completed_replies: dict[str, str] = {}
 
     async def connect(self):
         ws_url = SIJBA_URL.replace("https://", "wss://").replace("http://", "ws://")
         ws_url = f"{ws_url}/api/plugin/ws?token={SIJBA_TOKEN}"
         _log(f"Connecting to {ws_url} as {PLUGIN_ID}")
-        self.ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=10, close_timeout=5)
+        # Generous ping_timeout: long agent turns + proxies that delay
+        # protocol pongs. App-level JSON ping/pong is handled in message_loop.
+        self.ws = await websockets.connect(
+            ws_url, ping_interval=30, ping_timeout=60, close_timeout=5,
+        )
         _log("Connected!")
 
         await self.ws.send(json.dumps({
@@ -341,7 +355,27 @@ class PluginClient:
             },
         }))
         self._reconnect_backoff = 5
-        await self.message_loop()
+        self._worker_task = asyncio.create_task(self._message_worker())
+        try:
+            await self.message_loop()
+        finally:
+            if self._worker_task is not None:
+                self._worker_task.cancel()
+                try:
+                    await self._worker_task
+                except asyncio.CancelledError:
+                    pass
+                self._worker_task = None
+
+    async def _message_worker(self) -> None:
+        while True:
+            msg = await self._msg_queue.get()
+            try:
+                await self.handle_message(msg)
+            except Exception as exc:
+                _log(f"handle_message error: {exc}")
+            finally:
+                self._msg_queue.task_done()
 
     async def message_loop(self):
         try:
@@ -353,7 +387,7 @@ class PluginClient:
                 elif mtype == "channel_registered":
                     _log(f"Channel registered: {msg['channel_id']} (ok={msg.get('ok')})")
                 elif mtype == "message":
-                    await self.handle_message(msg)
+                    await self._msg_queue.put(msg)
                 elif mtype == "ping":
                     await self.ws.send(json.dumps({"type": "pong"}))
                 elif mtype == "error":
@@ -362,6 +396,13 @@ class PluginClient:
             _log("Connection closed")
         except Exception as exc:
             _log(f"Message loop error: {exc}")
+
+    def _remember_reply(self, envelope_id: str, text: str) -> None:
+        self._completed_replies[envelope_id] = text
+        # Bound memory — keep the most recent ~50 completed turns.
+        while len(self._completed_replies) > 50:
+            oldest = next(iter(self._completed_replies))
+            self._completed_replies.pop(oldest, None)
 
     async def _reply(self, channel_id: str, envelope_id: str, text: str) -> None:
         try:
@@ -381,7 +422,9 @@ class PluginClient:
             if rest.strip().isdigit():
                 n = min(int(rest.strip()), len(_LOG_BUFFER) or 10)
             lines = list(_LOG_BUFFER)[-n:]
-            await self._reply(channel_id, envelope_id, "\n".join(lines) or "(no logs yet)")
+            reply = "\n".join(lines) or "(no logs yet)"
+            self._remember_reply(envelope_id, reply)
+            await self._reply(channel_id, envelope_id, reply)
             return True
 
         if cmd in ("archive", "pause"):
@@ -390,9 +433,13 @@ class PluginClient:
             try:
                 _set_registry_status(PROJECT_NAME, status)
             except Exception as exc:
-                await self._reply(channel_id, envelope_id, f"Error updating registry: {exc}")
+                reply = f"Error updating registry: {exc}"
+                self._remember_reply(envelope_id, reply)
+                await self._reply(channel_id, envelope_id, reply)
                 return True
-            await self._reply(channel_id, envelope_id, f"{PROJECT_NAME} {status}. Stopping.")
+            reply = f"{PROJECT_NAME} {status}. Stopping."
+            self._remember_reply(envelope_id, reply)
+            await self._reply(channel_id, envelope_id, reply)
             _log(f"{status} via /{cmd} — shutting down (exit {code})")
             self.exit_code = code
             self.shutdown_event.set()
@@ -402,16 +449,20 @@ class PluginClient:
         if cmd == "reset":
             await self.session.reset()
             self.session_started = False
-            await self._reply(channel_id, envelope_id, f"{PROJECT_NAME} reset — next message starts fresh, no prior context.")
+            reply = f"{PROJECT_NAME} reset — next message starts fresh, no prior context."
+            self._remember_reply(envelope_id, reply)
+            await self._reply(channel_id, envelope_id, reply)
             return True
 
         if cmd:
             # Slash commands meant for cursor-agent itself (/help, /model, ...)
             # hang indefinitely in headless mode — fail fast instead.
-            await self._reply(
-                channel_id, envelope_id,
-                "Unsupported here: /archive, /pause, /reset, /log [n]. Anything else — just plain text.",
+            reply = (
+                "Unsupported here: /archive, /pause, /reset, /log [n]. "
+                "Anything else — just plain text."
             )
+            self._remember_reply(envelope_id, reply)
+            await self._reply(channel_id, envelope_id, reply)
             return True
         return False
 
@@ -422,11 +473,39 @@ class PluginClient:
         text = payload["text"]
         attachments = payload.get("attachments") or []
 
+        # Core redelivers unanswered envelopes after reconnect. If we already
+        # finished this turn, just resend the cached reply. If it's still
+        # running, wait — don't start a second cursor-agent.
+        if envelope_id in self._completed_replies:
+            _log(f"redelivery of completed envelope={envelope_id} — resending reply")
+            await self._reply(channel_id, envelope_id, self._completed_replies[envelope_id])
+            return
+        if envelope_id in self._inflight:
+            _log(f"redelivery of in-flight envelope={envelope_id} — waiting")
+            await self._inflight[envelope_id].wait()
+            if envelope_id in self._completed_replies:
+                await self._reply(channel_id, envelope_id, self._completed_replies[envelope_id])
+            return
+
+        done = asyncio.Event()
+        self._inflight[envelope_id] = done
+        try:
+            await self._handle_message_inner(channel_id, envelope_id, text, attachments)
+        finally:
+            done.set()
+            self._inflight.pop(envelope_id, None)
+
+    async def _handle_message_inner(
+        self, channel_id: str, envelope_id: str, text: str, attachments: list,
+    ) -> None:
         for trigger in (PROJECT_NAME, CHANNEL_ID):
             if text.lower().startswith(trigger.lower()):
                 text = text[len(trigger):].strip()
                 break
         if not text and not attachments:
+            # Still ack so Core clears the pending entry.
+            self._remember_reply(envelope_id, "")
+            await self._reply(channel_id, envelope_id, "")
             return
 
         if text.lstrip().startswith("/"):
@@ -444,6 +523,8 @@ class PluginClient:
             note += f"[Achtung: {len(attachments) - len(fetched)} Anhang/Anhänge konnten nicht geladen werden]\n\n"
         text = f"{note}{text}".strip()
         if not text:
+            self._remember_reply(envelope_id, "")
+            await self._reply(channel_id, envelope_id, "")
             return
 
         if not self.session_started:
@@ -476,6 +557,7 @@ class PluginClient:
             except Exception as exc:
                 _log(f"Failed to send channel_update: {exc}")
 
+        self._remember_reply(envelope_id, reply_text)
         await self._reply(channel_id, envelope_id, reply_text)
 
     async def run_forever(self):
