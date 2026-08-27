@@ -346,9 +346,12 @@ class PluginClient:
                     "label": f"Cursor: {PROJECT_NAME}",
                     "hint": (
                         f"Cursor Agent for project '{PROJECT_NAME}' at {WORK_DIR}. "
-                        f"Trigger: '{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /log [n]."
+                        f"Trigger: '@{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /log [n]."
                     ),
-                    "triggers": [PROJECT_NAME, CHANNEL_ID],
+                    # Core only routes message text on an explicit @mention, so
+                    # a bare project name cannot hijack a sentence that merely
+                    # starts with that word.
+                    "triggers": [f"@{PROJECT_NAME}", f"@{CHANNEL_ID}"],
                     "capabilities": ["code", "analysis", "debugging", "files", "terminal", "refactor", "test"],
                     "metadata": {"plugin": PLUGIN_NAME, "project": PROJECT_NAME, "working_dir": str(WORK_DIR)},
                 }
