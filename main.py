@@ -305,7 +305,10 @@ class CursorSession:
                     "model": model,
                 }
 
-            return {"text": final_text or "(no output)", "request_id": request_id, "model": model, "usage": usage}
+            # Empty on a clean exit = the agent did its work silently (e.g.
+            # @obsidian filing a note). Return it as-is; sijba drops a silent
+            # reply instead of pushing a bare "(no output)" to the channel.
+            return {"text": final_text, "request_id": request_id, "model": model, "usage": usage}
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
                 proc.kill()
