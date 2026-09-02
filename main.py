@@ -282,12 +282,29 @@ class CursorSession:
             await asyncio.wait_for(asyncio.gather(_pump_stdout(), _pump_stderr()), timeout=600)
             await proc.wait()
 
-            if stderr_buf:
-                _log(f"stderr: {bytes(stderr_buf).decode(errors='replace').strip()}")
+            stderr_text = bytes(stderr_buf).decode(errors="replace").strip()
+            if stderr_text:
+                _log(f"stderr: {stderr_text}")
             _log(
                 f"usage model={model} in={_fmt_tokens(usage.get('inputTokens', 0))} "
                 f"cached={_fmt_tokens(usage.get('cacheReadTokens', 0))} out={_fmt_tokens(usage.get('outputTokens', 0))}"
             )
+
+            # cursor-agent failed (login expired, quota, crash, broken
+            # --resume, ...): it exits non-zero and emits no `result`, so
+            # `final_text` stays empty. Surface the real error to the channel
+            # instead of a mystifying "(no output)", and drop the session id so
+            # the next turn starts clean rather than re-resuming a bad state.
+            if proc.returncode != 0 and not final_text:
+                self.cursor_session_id = None
+                detail = stderr_text or f"exited {proc.returncode}, no output"
+                _log(f"invocation failed (exit {proc.returncode}) — session reset")
+                return {
+                    "text": f"Error: cursor-agent failed — {_truncate(detail, 800)}",
+                    "request_id": request_id,
+                    "model": model,
+                }
+
             return {"text": final_text or "(no output)", "request_id": request_id, "model": model, "usage": usage}
         except asyncio.TimeoutError:
             if proc and proc.returncode is None:
