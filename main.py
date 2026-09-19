@@ -13,6 +13,8 @@ Plugin contract (documented in sijba-agent-controller/README.md):
     process actually stops, so the controller can tell "stopped on
     purpose" apart from "crashed" purely from the exit code
   - handle /log [n] locally from an in-memory ring buffer
+  - handle /model [name] locally: persists a per-project override to
+    WORK_DIR/.cursor-agent.json, read fresh every turn (see CONFIG_PATH)
 
 Environment variables
 ----------------------
@@ -23,6 +25,9 @@ WORK_DIR        Working directory for Cursor (required)
 REGISTRY_FILE   Path to the controller's registry.json (required)
 CURSOR_CMD      Cursor CLI command (default: cursor-agent)
 CURSOR_ARGS     Extra args for cursor-agent (default: "")
+CURSOR_MODEL    Catalog-wide default model passed as --model (default: unset,
+                i.e. cursor-agent's own default). Per-project override via
+                the in-channel /model [name] command — see CONFIG_PATH below.
 """
 from __future__ import annotations
 
@@ -54,6 +59,7 @@ WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
 REGISTRY_FILE = os.environ.get("REGISTRY_FILE", "")
 CURSOR_CMD = os.environ.get("CURSOR_CMD", "cursor-agent")
 CURSOR_ARGS = os.environ.get("CURSOR_ARGS", "").split()
+DEFAULT_MODEL = os.environ.get("CURSOR_MODEL", "")
 
 if not SIJBA_TOKEN:
     print("ERROR: SIJBA_TOKEN environment variable required", file=sys.stderr)
@@ -71,6 +77,12 @@ if not REGISTRY_FILE:
 PLUGIN_ID = f"{PLUGIN_NAME}-{PROJECT_NAME}"
 CHANNEL_ID = f"{PLUGIN_NAME}:{PROJECT_NAME}"
 
+# Per-project model override — same shape/rationale as sijba-pi-plugin's
+# .pi.json: one cursor-agent project might want a stronger/cheaper model
+# than another, so it lives in the project's own WORK_DIR rather than the
+# shared catalog entry (an env var can't express "just this one channel").
+CONFIG_PATH = WORK_DIR / ".cursor-agent.json"
+
 _LOG_BUFFER: collections.deque[str] = collections.deque(maxlen=200)
 
 
@@ -79,6 +91,27 @@ def _log(msg: str) -> None:
     line = f"{ts} [{PROJECT_NAME}] {msg}"
     _LOG_BUFFER.append(line)
     print(line, flush=True)
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        _log(f"ignoring unreadable {CONFIG_PATH}: {exc}")
+        return {}
+
+
+def _save_config(cfg: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+
+def current_model() -> str:
+    """Empty string means "no --model flag" — cursor-agent picks its own
+    default (whatever the account's normally-selected model is), same as
+    today's behavior for every project that never sets one."""
+    return _load_config().get("model") or DEFAULT_MODEL
 
 
 def _set_registry_status(name: str, status: str) -> None:
@@ -229,6 +262,9 @@ class CursorSession:
         cmd = [CURSOR_CMD, "-p", "--force", "--output-format", "stream-json", "--stream-partial-output"]
         if self.cursor_session_id:
             cmd += ["--resume", self.cursor_session_id]
+        model = current_model()
+        if model:
+            cmd += ["--model", model]
         cmd += CURSOR_ARGS + [text]
 
         proc = None
@@ -363,7 +399,8 @@ class PluginClient:
                     "label": f"Cursor: {PROJECT_NAME}",
                     "hint": (
                         f"Cursor Agent for project '{PROJECT_NAME}' at {WORK_DIR}. "
-                        f"Trigger: '@{PROJECT_NAME} ...'. In-channel commands: /archive, /pause, /log [n]."
+                        f"Trigger: '@{PROJECT_NAME} ...'. In-channel commands: "
+                        f"/archive, /pause, /reset, /model [name], /log [n]."
                     ),
                     # Core only routes message text on an explicit @mention, so
                     # a bare project name cannot hijack a sentence that merely
@@ -447,6 +484,27 @@ class PluginClient:
             await self._reply(channel_id, envelope_id, reply)
             return True
 
+        if cmd == "model":
+            new_model = rest.strip()
+            if not new_model:
+                cfg_model = _load_config().get("model")
+                if cfg_model:
+                    source = f"set for this project ({CONFIG_PATH.name})"
+                elif DEFAULT_MODEL:
+                    source = f"catalog default (CURSOR_MODEL={DEFAULT_MODEL})"
+                else:
+                    source = "cursor-agent's own default (no override set)"
+                reply = f"Current model: {current_model() or '(cursor-agent default)'} — {source}"
+            else:
+                cfg = _load_config()
+                cfg["model"] = new_model
+                _save_config(cfg)
+                reply = f"Model for {PROJECT_NAME} set to {new_model} (next turn uses it)."
+                _log(f"model changed to {new_model!r} via /model")
+            self._remember_reply(envelope_id, reply)
+            await self._reply(channel_id, envelope_id, reply)
+            return True
+
         if cmd in ("archive", "pause"):
             status = "archived" if cmd == "archive" else "paused"
             code = EXIT_ARCHIVED if cmd == "archive" else EXIT_PAUSED
@@ -475,10 +533,12 @@ class PluginClient:
             return True
 
         if cmd:
-            # Slash commands meant for cursor-agent itself (/help, /model, ...)
-            # hang indefinitely in headless mode — fail fast instead.
+            # Slash commands meant for cursor-agent itself (/help, ...) hang
+            # indefinitely in headless mode — fail fast instead. /model is
+            # handled above, locally, precisely because passing it straight
+            # through would hit this same hang.
             reply = (
-                "Unsupported here: /archive, /pause, /reset, /log [n]. "
+                "Unsupported here: /archive, /pause, /reset, /model [name], /log [n]. "
                 "Anything else — just plain text."
             )
             self._remember_reply(envelope_id, reply)
