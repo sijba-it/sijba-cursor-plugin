@@ -36,6 +36,7 @@ import collections
 import fcntl
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -84,6 +85,21 @@ CHANNEL_ID = f"{PLUGIN_NAME}:{PROJECT_NAME}"
 CONFIG_PATH = WORK_DIR / ".cursor-agent.json"
 
 _LOG_BUFFER: collections.deque[str] = collections.deque(maxlen=200)
+
+# Env vars the spawned cursor-agent subprocess (and anything its own bash
+# tool runs) has no legitimate need for. Found live: asyncio's
+# create_subprocess_exec inherits the *full* parent environment by default
+# when no env= is given — so without this, every cursor-agent turn (and
+# any shell command the agent itself decides to run) got a free copy of
+# SIJBA_TOKEN, the one shared bearer token that also authorizes sijba
+# Core's entire HTTP API (queue/transcript/message/store — not just this
+# plugin's own WebSocket). An LLM-driven agent executing arbitrary,
+# potentially prompt-injected shell commands must not carry that around.
+_AGENT_ENV_STRIP = ("SIJBA_TOKEN", "SIJBA_URL", "REGISTRY_FILE")
+
+
+def _agent_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in _AGENT_ENV_STRIP}
 
 
 def _log(msg: str) -> None:
@@ -222,6 +238,21 @@ async def _fetch_attachments(attachments: list, work_dir: Path) -> list[str]:
     return fetched
 
 
+_INJECT_BLOCK_RE = re.compile(r"```sijba-inject\s+(\S+)\n(.*?)\n```", re.DOTALL)
+
+
+def _extract_inject_blocks(text: str) -> list[tuple[str, str]]:
+    """Find ` ```sijba-inject <channel_id>\\n...\\n``` ` blocks in a
+    *complete* reply (never partial/streamed text — a marker split across
+    two text_delta chunks would just fail to match, which is fine, but
+    matching on partial content risks matching a half-written block that
+    later turns out different once the model finishes). Deliberately does
+    NOT strip the block from the text it was found in — the human should
+    see what their agent asked to forward and where, not have it vanish
+    into a hidden side channel."""
+    return [(target, content.strip()) for target, content in _INJECT_BLOCK_RE.findall(text)]
+
+
 def _describe_tool_call(tool_call: dict) -> str:
     for key, val in tool_call.items():
         if not key.endswith("ToolCall") or not isinstance(val, dict):
@@ -274,6 +305,7 @@ class CursorSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.work_dir,
+                env=_agent_env(),
             )
             final_text = ""
             model = "?"
@@ -636,6 +668,15 @@ class PluginClient:
                 }))
             except Exception as exc:
                 _log(f"Failed to send channel_update: {exc}")
+
+        for target, inject_text in _extract_inject_blocks(reply_text):
+            try:
+                await self.ws.send(json.dumps({
+                    "type": "inject", "channel": channel_id, "target": target, "text": inject_text,
+                }))
+                _log(f"inject -> {target!r} ({len(inject_text)} chars)")
+            except Exception as exc:
+                _log(f"Failed to send inject to {target!r}: {exc}")
 
         self._remember_reply(envelope_id, reply_text)
         await self._reply(channel_id, envelope_id, reply_text)
