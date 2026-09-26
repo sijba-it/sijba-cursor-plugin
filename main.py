@@ -238,7 +238,7 @@ async def _fetch_attachments(attachments: list, work_dir: Path) -> list[str]:
     return fetched
 
 
-_INJECT_BLOCK_RE = re.compile(r"```sijba-inject\s+(\S+)\n(.*?)\n```", re.DOTALL)
+_INJECT_BLOCK_RE = re.compile(r"```sijba-inject ([^\n]+)\n(.*?)\n```", re.DOTALL)
 
 
 def _extract_inject_blocks(text: str) -> list[tuple[str, str]]:
@@ -250,7 +250,7 @@ def _extract_inject_blocks(text: str) -> list[tuple[str, str]]:
     NOT strip the block from the text it was found in — the human should
     see what their agent asked to forward and where, not have it vanish
     into a hidden side channel."""
-    return [(target, content.strip()) for target, content in _INJECT_BLOCK_RE.findall(text)]
+    return [(target.strip(), content.strip()) for target, content in _INJECT_BLOCK_RE.findall(text)]
 
 
 def _describe_tool_call(tool_call: dict) -> str:
