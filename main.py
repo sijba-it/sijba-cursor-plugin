@@ -18,7 +18,7 @@ Plugin contract (documented in sijba-agent-controller/README.md):
 
 Environment variables
 ----------------------
-SIJBA_URL       sijba WebSocket URL (default: wss://sijba.edv-bartl.at)
+SIJBA_URL       sijba WebSocket URL (required) — e.g. wss://<account>.sijba.eu
 SIJBA_TOKEN     Auth token (required)
 PROJECT_NAME    Registry key / trigger word (required) — e.g. "sijba-web"
 WORK_DIR        Working directory for Cursor (required)
@@ -53,7 +53,11 @@ EXIT_PAUSED = 91
 
 PLUGIN_NAME = "cursor"  # this repo *is* the cursor plugin — no TOOL switch needed
 
-SIJBA_URL = os.environ.get("SIJBA_URL", "wss://sijba.edv-bartl.at")
+SIJBA_URL = os.environ.get("SIJBA_URL", "")
+if not SIJBA_URL:
+    print("ERROR: SIJBA_URL environment variable required (e.g. wss://<account>.sijba.eu)", file=sys.stderr)
+    sys.exit(1)
+
 SIJBA_TOKEN = os.environ.get("SIJBA_TOKEN", "")
 PROJECT_NAME = os.environ.get("PROJECT_NAME", "")
 WORK_DIR = Path(os.environ.get("WORK_DIR", ""))
