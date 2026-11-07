@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import fnmatch
 import fcntl
 import json
 import os
@@ -132,6 +133,62 @@ def current_model() -> str:
     default (whatever the account's normally-selected model is), same as
     today's behavior for every project that never sets one."""
     return _load_config().get("model") or DEFAULT_MODEL
+
+
+_MODEL_CACHE: tuple[float, list[tuple[str, str]]] | None = None
+
+
+async def available_models() -> list[tuple[str, str]] | None:
+    """(id, name) pairs from `cursor-agent --list-models` — what this account
+    can use right now. Cached for an hour; None if the list can't be read."""
+    global _MODEL_CACHE
+    if _MODEL_CACHE and time.monotonic() - _MODEL_CACHE[0] < 3600:
+        return _MODEL_CACHE[1]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            CURSOR_CMD, "--list-models", stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, env=_agent_env(),
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except (asyncio.TimeoutError, OSError) as exc:
+        _log(f"model list unavailable: {exc!r}")
+        return None
+    models = []
+    for line in out.decode(errors="replace").replace("\u200b", "").splitlines():
+        model_id, sep, name = line.partition(" - ")
+        if sep and model_id.strip() and " " not in model_id.strip():
+            name = " ".join(name.split()).removesuffix(" (current)")
+            models.append((model_id.strip(), name))
+    if not models:
+        return None
+    _MODEL_CACHE = (time.monotonic(), models)
+    return models
+
+
+_VARIANT_TOKENS = {"low", "medium", "high", "xhigh", "max", "fast", "thinking"}
+
+
+def _family(model_id: str) -> str:
+    """claude-opus-5-thinking-high-fast -> claude-opus-5: the list has one entry
+    per effort/speed variant, far too many to show one by one."""
+    tokens = model_id.split("-")
+    while len(tokens) > 1 and tokens[-1] in _VARIANT_TOKENS:
+        tokens.pop()
+    return "-".join(tokens)
+
+
+def _model_list(models: list[tuple[str, str]], current: str) -> str:
+    current = current or "auto"
+    if len(models) <= 30:
+        return "Available:\n" + "\n".join(
+            f"  {mid} — {name}{' ←' if mid == current else ''}" for mid, name in models)
+    families: dict[str, int] = {}
+    for mid, _ in models:
+        families[_family(mid)] = families.get(_family(mid), 0) + 1
+    lines = [f"  {fam}" + (f" ({n} variants)" if n > 1 else "") + (" ←" if fam == _family(current) else "")
+             for fam, n in families.items()]
+    return (f"{len(models)} models in {len(families)} families:\n" + "\n".join(lines)
+            + "\n\nSee the variants with /model <text> or a pattern, e.g. /model sonnet or /model claude-opus-5-5*.")
 
 
 def _set_registry_status(name: str, status: str) -> None:
@@ -521,22 +578,53 @@ class PluginClient:
             return True
 
         if cmd == "model":
-            new_model = rest.strip()
-            if not new_model:
-                cfg_model = _load_config().get("model")
-                if cfg_model:
+            arg = rest.strip()
+            models = await available_models()
+            cfg = _load_config()
+            if not arg:
+                if cfg.get("model"):
                     source = f"set for this project ({CONFIG_PATH.name})"
                 elif DEFAULT_MODEL:
                     source = f"catalog default (CURSOR_MODEL={DEFAULT_MODEL})"
                 else:
-                    source = "cursor-agent's own default (no override set)"
-                reply = f"Current model: {current_model() or '(cursor-agent default)'} — {source}"
-            else:
-                cfg = _load_config()
-                cfg["model"] = new_model
+                    source = "cursor-agent's own default"
+                reply = f"Current model: {current_model() or 'auto'} — {source}"
+                reply += "\n\n" + (_model_list(models, current_model()) if models else "(model list unavailable right now)")
+                reply += "\n\nSet with /model <id> — back with /model default."
+            elif arg.lower() == "default":
+                cfg.pop("model", None)
                 _save_config(cfg)
-                reply = f"Model for {PROJECT_NAME} set to {new_model} (next turn uses it)."
-                _log(f"model changed to {new_model!r} via /model")
+                fallback = DEFAULT_MODEL or "cursor-agent's own default"
+                reply = f"Model for {PROJECT_NAME} back to {fallback} (next turn uses it)."
+                _log("model override removed via /model default")
+            else:
+                pattern = any(ch in arg for ch in "*?")     # /model claude-opus-5-5* only ever lists
+                needle = arg.lower()
+                if pattern:
+                    hits = [(mid, name) for mid, name in models or []
+                            if fnmatch.fnmatch(mid.lower(), needle) or fnmatch.fnmatch(name.lower(), needle)]
+                else:
+                    hits = [(mid, name) for mid, name in models or []
+                            if needle in mid.lower() or needle in name.lower()]
+                exact = None if pattern else next(
+                    (mid for mid, name in models or [] if needle in (mid.lower(), name.lower())), None)
+                if pattern and models is None:
+                    reply = "(model list unavailable right now)"
+                elif pattern and not hits:
+                    reply = f"No model matches {arg!r}.\n\n{_model_list(models, current_model())}"
+                elif pattern or (not exact and len(hits) > 1):
+                    shown = "\n".join(f"  {mid} — {name}" for mid, name in hits[:40])
+                    more = f"\n  …and {len(hits) - 40} more" if len(hits) > 40 else ""
+                    reply = f"{len(hits)} model(s) match {arg!r} — set one with /model <id>:\n{shown}{more}"
+                elif exact or len(hits) == 1 or models is None:
+                    cfg["model"] = exact or (hits[0][0] if hits else arg)
+                    _save_config(cfg)
+                    reply = f"Model for {PROJECT_NAME} set to {cfg['model']} (next turn uses it)."
+                    if models is None:
+                        reply += " Couldn't check it against the model list — if the next turn fails, it doesn't exist."
+                    _log(f"model changed to {cfg['model']!r} via /model")
+                else:
+                    reply = f"Unknown model {arg!r}.\n\n{_model_list(models, current_model())}"
             self._remember_reply(envelope_id, reply)
             await self._reply(channel_id, envelope_id, reply)
             return True

@@ -39,6 +39,12 @@ In-channel commands (handled locally, never reach the `cursor-agent` CLI):
   omits `--resume` and starts a brand-new conversation. No prior context;
   doesn't touch the registry or the sijba channel.
 - `/log [n]` — last `n` (default 10) of this process's own log lines.
+- `/model [name]` — one command for everything:
+  - `/model` — current model + an overview of the account's models by family
+    (from `cursor-agent --list-models`, ~270 entries, so grouped)
+  - `/model sonnet` — sets it if exactly one model matches, otherwise lists the matches
+  - `/model claude-opus-5-5*` — a pattern (`*`, `?`) only lists, never sets
+  - `/model default` — back to the default. Stored in `WORK_DIR/.cursor-agent.json`.
 
 ## Cursor CLI requirements
 
