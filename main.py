@@ -483,6 +483,38 @@ def _is_kill_command(text: str) -> bool:
     return cmd.lower().strip() == "kill"
 
 
+def _project_description() -> str:
+    """The channel hint: what this project is about. sijba's router tells
+    channels apart by it, so it has to be specific to the project — generic
+    plugin text would read the same on every channel. The controller's
+    per-project description (PROJECT_DESCRIPTION, `describe` command) wins,
+    else the first paragraph of the project's README.md, else just the
+    project name. Not CLAUDE.md / AGENTS.md: those are instructions to the
+    agent (personas, internal URLs), not a description of the project."""
+    desc = os.environ.get("PROJECT_DESCRIPTION", "").strip()
+    if desc:
+        return desc
+    for name in ("README.md",):
+        try:
+            text = (WORK_DIR / name).read_text(errors="replace")
+        except OSError:
+            continue
+        para: list[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "![", "[![", "<", "---", "```", "|", ">")):
+                if para:
+                    break
+                continue
+            para.append(line)
+        if para:
+            text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", " ".join(para))   # [text](url) -> text
+            text = re.sub(r"[*_`]", "", text).strip()
+            if text:
+                return text[:300] + ("…" if len(text) > 300 else "")
+    return f"Project {PROJECT_NAME}"
+
+
 class PluginClient:
     def __init__(self):
         self.ws = None
@@ -521,11 +553,7 @@ class PluginClient:
             "channels": {
                 CHANNEL_ID: {
                     "label": f"Cursor: {PROJECT_NAME}",
-                    "hint": (
-                        f"Cursor Agent for project '{PROJECT_NAME}' at {WORK_DIR}. "
-                        f"Trigger: '@{PROJECT_NAME} ...'. In-channel commands: "
-                        f"/archive, /pause, /reset, /kill, /model [name], /log [n]."
-                    ),
+                    "hint": _project_description(),
                     # Core only routes message text on an explicit @mention, so
                     # a bare project name cannot hijack a sentence that merely
                     # starts with that word.
